@@ -155,6 +155,11 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/extend \
 是否已推进，都直接返回首次延长的同一结果，不重复写入。仅时间相同而 `reason` 不同不算
 重放，按普通请求校验（若当前值已未再延长，则收到 409，状态不变）。
 
+「最近一次延长」按延长链的业务顺序认定：先按 `created_at` 排序，**同一时刻连续发生
+多次延长时按新截止时间的严格递增排序**，与审计记录的 UUID 大小无关。因此同一时刻连续
+成功延长两次、即便第二条记录的 UUID 更小，第二条（链尾）请求重放仍幂等返回其首次
+响应；事件时间线中同一时刻的延长条目也按这一顺序排列，与延长链一致。
+
 ```bash
 # 与上一次成功延长完全一致 -> 200，返回与首次完全相同的结果（幂等）
 curl -s -X POST http://localhost:8000/events/<EVENT_ID>/extend \
@@ -201,11 +206,15 @@ curl -s 'http://localhost:8000/events/<EVENT_ID>/snapshot?at=2030-01-01T00:30:00
 
 **回放规则**（所有比较按 UTC 时刻，边界均**含 `at` 本身**）：
 
-- 以事件创建记录为起点，按发生时间 `(created_at, id)` 升序回放
+- 以事件创建记录为起点，按延长链的业务顺序
+  `(created_at, new_commit_deadline, new_reveal_deadline, id)` 升序回放
   `deadline_extensions`：仅 `created_at <= at` 的延长在该时刻已生效，
   **最近一条**已生效延长的新截止时间即当时生效的 `commit_deadline` /
   `reveal_deadline`；若首次延长尚未发生，则使用创建时的原始截止时间
-  （即首条延长审计记录的旧值）；
+  （即首条延长审计记录的旧值）。不同时刻仍以发生时间为准；**同一时刻
+  连续多次延长**时，按链上新截止时间的严格递增识别先后，与审计记录的
+  UUID 大小无关——因此即使业务顺序第二的记录 UUID 更小，该时刻快照也
+  会应用两次延长后的截止时间，不会回退；
 - `status` 用**回放后**的截止时间按常规半开语义判定：`at < commit_deadline`
   为 `commit`，`at < reveal_deadline` 为 `reveal`，其后为 `closed`；
 - `commitment_count` / `reveal_count` 只统计 `created_at <= at` 的记录

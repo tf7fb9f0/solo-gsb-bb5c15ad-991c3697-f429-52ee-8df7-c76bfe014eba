@@ -13,6 +13,7 @@ SQLite 文件库 + 模拟时钟（与 test_extend.py 相同手法），覆盖：
 
 import os
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 
 _tmpdir = tempfile.mkdtemp(prefix="sealed_predictions_snapshot_test_")
@@ -23,7 +24,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import app.clock as clock_module  # noqa: E402
 import app.main as main_module  # noqa: E402
+from app.database import SessionLocal  # noqa: E402
 from app.hashing import compute_commitment  # noqa: E402
+from app.models import DeadlineExtension  # noqa: E402
 
 T0 = datetime(2030, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -197,6 +200,83 @@ def test_snapshot_after_second_extension_uses_latest_deadlines(replayed_event):
     assert body["status"] == "commit"
     assert body["commitment_count"] == 2
     assert body["reveal_count"] == 0
+
+
+def _invert_same_instant_extension_ids(event_id: str):
+    """同刻两条延长记录：把业务顺序第二的记录改成更小的 UUID，
+    第一次延长的改成更大的 UUID（经临时 UUID 两步改键）。"""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(DeadlineExtension)
+            .filter(DeadlineExtension.event_id == uuid.UUID(event_id))
+            .all()
+        )
+        assert len(rows) == 2
+        rows.sort(key=lambda e: e.new_commit_deadline)
+        first, second = rows
+        # 每次取互不相同的随机 UUID 并强制大小关系，避免跨用例主键冲突
+        a, b = uuid.uuid4(), uuid.uuid4()
+        while a == b:
+            b = uuid.uuid4()
+        high_id, low_id = (a, b) if a > b else (b, a)
+        first.id = uuid.uuid4()  # 临时键，腾出目标值
+        db.flush()
+        second.id = low_id
+        db.flush()
+        first.id = high_id
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_snapshot_same_instant_two_extensions_ignores_uuid_order():
+    """同一时刻连续成功延长两次、第二条记录 UUID 更小：该时刻快照必须
+    应用两次延长后的截止时间（按延长链新截止时间严格递增识别先后），
+    不回退到旧截止时间。"""
+    event_id = create_event()
+    first_commit = COMMIT_DL + timedelta(hours=1)
+    first_reveal = REVEAL_DL + timedelta(hours=1)
+    second_commit = COMMIT_DL + timedelta(hours=2)
+    second_reveal = REVEAL_DL + timedelta(hours=2)
+
+    # 时钟停在 T0：两次延长写在同一 created_at 时刻
+    extend(event_id, first_commit, first_reveal, "同刻第一次")
+    extend(event_id, second_commit, second_reveal, "同刻第二次")
+
+    # 制造「业务顺序第二的记录 UUID 反而更小」的同刻倒挂
+    _invert_same_instant_extension_ids(event_id)
+
+    # 恰好落在两次延长的同一时刻（边界含 at）：应用两次延长后的截止时间
+    body = snapshot(event_id, T0).json()
+    assert dt(body["commit_deadline"]) == second_commit
+    assert dt(body["reveal_deadline"]) == second_reveal
+    assert body["status"] == "commit"
+
+    # 未来时刻同样取链尾（第二次延长）的新截止时间
+    body = snapshot(event_id, T0 + timedelta(days=1)).json()
+    assert dt(body["commit_deadline"]) == second_commit
+    assert dt(body["reveal_deadline"]) == second_reveal
+
+    # 事件当前截止时间与快照一致
+    current = client.get(f"/events/{event_id}").json()
+    assert dt(current["commit_deadline"]) == second_commit
+    assert dt(current["reveal_deadline"]) == second_reveal
+
+    # 时间线同刻记录顺序仍与延长链一致：第一次 -> 第二次
+    tl = client.get(f"/events/{event_id}/timeline").json()
+    ext_entries = [e for e in tl["entries"] if e["type"] == "deadline_extended"]
+    assert dt(ext_entries[0]["detail"]["new_commit_deadline"]) == first_commit
+    assert dt(ext_entries[1]["detail"]["new_commit_deadline"]) == second_commit
+
+    # 最新请求（第二次延长）重放幂等：返回首次响应而非 409
+    replay = client.post(f"/events/{event_id}/extend", json={
+        "commit_deadline": iso(second_commit),
+        "reveal_deadline": iso(second_reveal),
+        "reason": "同刻第二次",
+    })
+    assert replay.status_code == 200, replay.text
+    assert dt(replay.json()["new_commit_deadline"]) == second_commit
 
 
 def test_snapshot_replay_changes_phase_vs_original_windows(replayed_event):
