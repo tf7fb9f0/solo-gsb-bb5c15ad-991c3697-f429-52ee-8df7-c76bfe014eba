@@ -128,7 +128,8 @@ curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 - 任何校验失败均回滚事务，**不改变截止时间**，也不写入任何记录；
 - 响应同时返回旧值、新值与 `reason`；每次成功延长都会写入审计表
   `deadline_extensions`，并作为 `deadline_extended` 条目出现在事件时间线中
-  （时间线里的 `event_created` 始终展示创建时的原始截止时间）。
+  （时间线里的 `event_created` 始终展示创建时的原始截止时间；同一时刻连续
+  多次延长时，同刻记录按延长链顺序排列，即新截止时间严格递增的业务顺序）。
 
 ```bash
 curl -s -X POST http://localhost:8000/events/<EVENT_ID>/extend \
@@ -150,10 +151,13 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/extend \
 }
 ```
 
-**幂等重放**：对**最近一次成功延长**提交完全相同的请求（新 `commit_deadline`、新
-`reveal_deadline` 与 `reason` 三者均一致，按 UTC 时刻比较），无论间隔多久、服务端时钟
-是否已推进，都直接返回首次延长的同一结果，不重复写入。仅时间相同而 `reason` 不同不算
-重放，按普通请求校验（若当前值已未再延长，则收到 409，状态不变）。
+**幂等重放**：对**最近一次成功延长**（即延长链链尾，按新截止时间严格
+递增确定，与记录写入时刻及 UUID 无关）提交完全相同的请求（新
+`commit_deadline`、新 `reveal_deadline` 与 `reason` 三者均一致，按 UTC
+时刻比较），无论间隔多久、服务端时钟是否已推进，都直接返回首次延长的同一
+结果，不重复写入。即使两次延长发生在**同一时刻**，最近一次仍按延长链
+（新截止时间递增）识别，不会因记录 UUID 大小认错。仅时间相同而 `reason`
+不同不算重放，按普通请求校验（若当前值已未再延长，则收到 409，状态不变）。
 
 ```bash
 # 与上一次成功延长完全一致 -> 200，返回与首次完全相同的结果（幂等）
@@ -201,11 +205,13 @@ curl -s 'http://localhost:8000/events/<EVENT_ID>/snapshot?at=2030-01-01T00:30:00
 
 **回放规则**（所有比较按 UTC 时刻，边界均**含 `at` 本身**）：
 
-- 以事件创建记录为起点，按发生时间 `(created_at, id)` 升序回放
-  `deadline_extensions`：仅 `created_at <= at` 的延长在该时刻已生效，
-  **最近一条**已生效延长的新截止时间即当时生效的 `commit_deadline` /
-  `reveal_deadline`；若首次延长尚未发生，则使用创建时的原始截止时间
-  （即首条延长审计记录的旧值）；
+- 以事件创建记录为起点，按延长链业务顺序回放
+  `deadline_extensions`——延长链中每条成功延长的新截止时间严格递增，
+  因此**按 `(new_commit_deadline, new_reveal_deadline)` 升序即业务发生
+  先后**（同一时刻连续多次延长时也成立，不依赖记录 UUID 大小）；仅
+  `created_at <= at` 的延长在该时刻已生效，**最近一条**已生效延长的新
+  截止时间即当时生效的 `commit_deadline` / `reveal_deadline`；若首次
+  延长尚未发生，则使用创建时的原始截止时间（即首条延长审计记录的旧值）；
 - `status` 用**回放后**的截止时间按常规半开语义判定：`at < commit_deadline`
   为 `commit`，`at < reveal_deadline` 为 `reveal`，其后为 `closed`；
 - `commitment_count` / `reveal_count` 只统计 `created_at <= at` 的记录
@@ -1072,6 +1078,7 @@ tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API
 tests/test_schedule.py        # 资源排程：最少轨道着色、半开复用、冲突对与确定性
 tests/test_reuse_audit.py     # 跨事件承诺复用审计：归一化查重、严格早于揭示判定、排序与只读
 tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制、幂等与时间线
+tests/test_extend_same_timestamp.py # 同刻连续延长：按延长链新截止时间排序的快照、幂等重放与时间线回归
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
 tests/test_settlement.py      # 永久结算：精确匹配计数、未结算状态、重复结算冲突与不改写

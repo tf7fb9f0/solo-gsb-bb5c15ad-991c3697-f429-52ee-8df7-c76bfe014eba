@@ -229,6 +229,33 @@ def extension_out(ext: DeadlineExtension) -> DeadlineExtensionOut:
     )
 
 
+def extensions_in_chain_order(db: Session, event_id: UUID) -> list[DeadlineExtension]:
+    """读取事件的全部延长审计记录，按延长链业务顺序返回。
+
+    排序依据是延长链中**严格递增的新截止时间**
+    ``(new_commit_deadline, new_reveal_deadline)``，而非记录的写入时刻与
+    UUID：同一次成功延长要求两个截止时间都严格晚于当前值，因此同一事件
+    的成功延长在新截止时间上构成严格递增链，新截止时间严格递增即业务上
+    的发生先后。
+
+    这避免了同一时刻（``created_at`` 相同）连续两次延长、且后一条记录的
+    UUID 恰好更小时，按 ``(created_at, id)`` 排序导致的链条倒置——该倒置
+    会让历史快照回退到旧截止时间，并让最新请求的幂等重放误报 409。
+    在 Python 侧排序（而非数据库 ORDER BY），保证 SQLite（测试）与
+    PostgreSQL（Compose）对带时区时间的比较逐字节一致。``/extend``、
+    ``/snapshot`` 与 ``/timeline`` 共用本排序依据。
+    """
+    rows = (
+        db.query(DeadlineExtension)
+        .filter(DeadlineExtension.event_id == event_id)
+        .all()
+    )
+    rows.sort(
+        key=lambda e: (as_utc(e.new_commit_deadline), as_utc(e.new_reveal_deadline))
+    )
+    return rows
+
+
 def settlement_out(event_id: UUID, settlement: Settlement | None) -> SettlementOut:
     if settlement is None:
         # 未结算时返回明确状态，其余字段均为 null
@@ -330,10 +357,11 @@ def get_event_snapshot(event_id: UUID, at: str | None = None, db: Session = Depe
     """按指定历史时刻重建事件视图（纯只读，不依赖服务端当前时钟）。
 
     回放规则（所有时间按 UTC 时刻比较，边界含 at 本身）：
-      - 起点为事件创建记录；按发生时间 (created_at, id) 升序回放
-        deadline_extensions，应用其中 created_at <= at 的延长——
-        最近一条已生效延长的新截止时间即当时生效的截止时间；at 早于
-        首次延长时，取首次延长记录中的旧值（即创建时的原始截止时间）；
+      - 起点为事件创建记录；按延长链业务顺序（新截止时间严格递增，而非
+        created_at 与 UUID）回放 deadline_extensions，应用其中
+        created_at <= at 的延长——最近一条已生效延长的新截止时间即当时
+        生效的截止时间；at 早于首次延长时，取首次延长记录中的旧值（即
+        创建时的原始截止时间）；
       - status 用回放后的截止时间按常规半开语义判定：
         at < commit_deadline 为 commit，at < reveal_deadline 为 reveal，
         其后为 closed；
@@ -357,13 +385,9 @@ def get_event_snapshot(event_id: UUID, at: str | None = None, db: Session = Depe
             "事件在该时刻尚不存在",
         )
 
-    # 按发生时间排序的延长审计：只应用 at（含）之前已写入的延长
-    extensions = (
-        db.query(DeadlineExtension)
-        .filter(DeadlineExtension.event_id == event.id)
-        .order_by(DeadlineExtension.created_at, DeadlineExtension.id)
-        .all()
-    )
+    # 按延长链业务顺序排序的延长审计（新截止时间严格递增）：
+    # 只应用 at（含）之前已写入的延长
+    extensions = extensions_in_chain_order(db, event.id)
     applied = [e for e in extensions if as_utc(e.created_at) <= snapshot_at]
     if applied:
         commit_dl = as_utc(applied[-1].new_commit_deadline)
@@ -429,13 +453,11 @@ def extend_event_deadlines(
     new_commit_dl = as_utc(payload.commit_deadline)
     new_reveal_dl = as_utc(payload.reveal_deadline)
 
-    # 幂等重放：与最近一次成功延长完全相同 -> 直接返回首次结果，不再写入
-    last_extension = (
-        db.query(DeadlineExtension)
-        .filter(DeadlineExtension.event_id == event.id)
-        .order_by(DeadlineExtension.created_at.desc(), DeadlineExtension.id.desc())
-        .first()
-    )
+    # 幂等重放：与最近一次成功延长完全相同 -> 直接返回首次结果，不再写入。
+    # 「最近一次」按延长链业务顺序（新截止时间严格递增）取链尾，而非按
+    # created_at/UUID 排序，保证同一时刻连续两次延长时不会认错最近记录。
+    extension_chain = extensions_in_chain_order(db, event.id)
+    last_extension = extension_chain[-1] if extension_chain else None
     if (
         last_extension is not None
         and as_utc(last_extension.new_commit_deadline) == new_commit_dl
@@ -1710,12 +1732,9 @@ def get_timeline(event_id: UUID, db: Session = Depends(get_db)):
     event = get_event_or_404(db, event_id)
     now = now_utc()
 
-    extensions = (
-        db.query(DeadlineExtension)
-        .filter(DeadlineExtension.event_id == event.id)
-        .order_by(DeadlineExtension.created_at, DeadlineExtension.id)
-        .all()
-    )
+    # 按延长链业务顺序排序（新截止时间严格递增）：同一时刻连续多次延长时，
+    # 时间线中的同刻记录顺序与延长链一致，不会被随机 UUID 顺序倒置
+    extensions = extensions_in_chain_order(db, event.id)
     # event_created 展示事件创建时的原始截止时间：若发生过延长，取首次延长的旧值
     if extensions:
         created_commit_dl = as_utc(extensions[0].old_commit_deadline)
